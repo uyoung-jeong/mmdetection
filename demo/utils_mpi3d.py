@@ -7,6 +7,8 @@ import numpy as np
 import h5py
 import scipy.io as sio
 from tqdm import tqdm
+
+from IPython import embed
     
 # work as a wrapper of inference pipeline
 # infer_fn: gets raw image as an input, and returns [0,1] range seg. map
@@ -31,6 +33,7 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, model, kwargs=None):
     vid_list = list(range(3)) + list(range(4,9)) # 0,1,2,4,5,6,7,8
 
     h, w = 2048, 2048 # image height, width
+    margin = 200
 
     # load MPI dataset
     #mpi_base_dir = '/home/uyoung/human_pose_estimation/datasets/mpi_inf_3dhp'
@@ -125,9 +128,28 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, model, kwargs=None):
                     ok_pts = np.logical_and(x_in, y_in)
                     if np.sum(ok_pts) < len(joints_map_idxs): # skip partly/totally invisible cases
                         continue
+                    
+                    # filter out non-human area. note that x,y positions are swapped
+                    xmin = np.min(joints[:,1])
+                    xmax = np.max(joints[:,1])
+                    ymin = np.min(joints[:,0])
+                    ymax = np.max(joints[:,0])
+                    bbox_center = [(xmin+xmax)/2,(ymin+ymax)/2]
+                    bbox_len = (np.max([xmax-xmin,ymax-ymin]) + 400)/2
+                    bbox = [np.max([bbox_center[0]-bbox_len, 0]), 
+                            np.min([bbox_center[0]+bbox_len, w]),
+                            np.max([bbox_center[1]-bbox_len, 0]), 
+                            np.min([bbox_center[1]+bbox_len, h])]
+                    bbox = np.array(bbox).astype(int)
+                    
+                    img_filtered = np.zeros(img.shape).astype(np.uint8)
+                    img_filtered[bbox[0]:bbox[1], bbox[2]:bbox[3]] = img[bbox[0]:bbox[1], bbox[2]:bbox[3]]
                         
                     # inference process
-                    seg_map, det_res = infer_fn(model, img, kwargs)
+                    seg_map, det_res = infer_fn(model, img_filtered, kwargs)
+                    if seg_map is None:
+                        print(f'{subj}/{seq}/{vid_i}_{i}: could not infer seg_map')
+                        continue
                     
                     cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg.png'), seg_map) # save seg map
                     cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_255.png'), seg_map * 255) # save seg map

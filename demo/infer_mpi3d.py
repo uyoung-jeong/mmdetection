@@ -65,9 +65,7 @@ def run(args):
             for i, bbox in enumerate(bbox_result)
         ]
         labels = np.concatenate(labels)
-
-        embed()
-        
+    
         # get person index
         person_idx = 0
         if isinstance(model.CLASSES, tuple):
@@ -83,7 +81,24 @@ def run(args):
             else:
                 segms = np.stack(segms, axis=0)
         
-        seg_map = segms[person_idx,:,:] * 1 # if boolean, change to int
+        # filter out results by threshold 
+        scores = bboxes[:, -1]
+        inds = scores > score_thr
+        bboxes_ = bboxes[inds, :]
+        labels_ = labels[inds]
+        segms_ = None
+        if segms is not None:
+            segms_ = segms[inds, ...]
+        else:
+            return None, None
+            
+        # aggregate person indices
+        seg_map = segms_[labels_==person_idx] * 1
+        
+        if seg_map.size == 0: # no segmap is generated
+            return None, None
+        
+        seg_map = np.max(seg_map, axis=0)
         seg_map = np.clip(seg_map * 1, 0, 1)
         seg_map = seg_map.astype(np.uint8)
 
