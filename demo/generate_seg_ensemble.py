@@ -1,21 +1,23 @@
 # This code generates segmentation map from preprocessed body part patches
 # Currently works only on MPI-INF-3DHP
+# python demo/generate_seg_ensemble.py --vis_dir /home/uyoung/human_pose_estimation/datasets/mpi_inf_3dhp --frame_freq 10
 
 import os
 from os import path
 import glob
-import json
 import scipy.io as sio
 import h5py
-import shutil
-
 from tqdm import tqdm
 
-from sklearn.neighbors import NearestNeighbors
+import torch
 import numpy as np
-
-import matplotlib.pyplot as plt
 import cv2
+from argparse import ArgumentParser
+
+import mmdet
+import mmcv
+from mmdet.apis import inference_detector, init_detector, show_result_pyplot
+from mmdet.core.visualization import imshow_det_bboxes
 
 from utils_mpi3d import infer_mpi3d_pipeline
 
@@ -30,16 +32,22 @@ class Config():
         self.cascade_mrcnn_checkpoint = 'checkpoints/cascade_mask_rcnn_x101_64x4d_fpn_20e_coco_20200512_161033-bdb5126a.pth'
         self.device = torch.device(0)
         self.mpi_base_dir = ''
+        self.vis_dir = 'mpi_vis_ensemble'
+        self.frame_freq = 1000
 
 def get_args():
     parser = ArgumentParser()
     parser.add_argument('--device', default=0)
     parser.add_argument('--mpi_base_dir', default='/home/uyoung/human_pose_estimation/datasets/mpi_inf_3dhp')
+    parser.add_argument('--vis_dir', default='mpi_vis_ensemble')
+    parser.add_argument('--frame_freq', default=1000, type=int)
     args = parser.parse_args()
 
     config = Config()
     config.device = torch.device(args.device)
     config.mpi_base_dir = args.mpi_base_dir
+    config.vis_dir = args.vis_dir
+    config.frame_freq = args.frame_freq
     return config
 
 def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
@@ -76,7 +84,7 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
 
     limb_thick = 0.1 # coefficient to make width of the limb parts.
     bone_margin_width = 10 # additional length added to the bone length
-    bone_margin_length = 0.24
+    bone_margin_length = 0.3
 
     # load MPI dataset
     #mpi_base_dir = '/home/uyoung/human_pose_estimation/datasets/mpi_inf_3dhp'
@@ -135,8 +143,6 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
 
 
     # iterate over each image
-    #vis_dir = 'mpi_vis'
-
     pbar = tqdm(total=len(mpi_train_subjects) * 2, desc='processing mpi train')
     for subj in mpi_train_subjects: # per subject
         subj_dir = path.join(mpi_base_dir, subj)
@@ -156,7 +162,9 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
                 img_list = glob.glob(path.join(video_dir, '*.jpg'))
                 img_list.sort()
                 for i, img_i in enumerate(img_list): # per frame
-                    if i % 1000 != 0: # process per every 100 frames
+                    if i < 100 and subj == 'S2' and seq=='Seq1': # S2, Seq1, frame 0 has incorrect gt
+                        continue
+                    if i % args.frame_freq != 0: # process per every frame_freq frames
                         continue
                     """
                     if i > 0:
@@ -206,10 +214,10 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
                     elif len(seg_maps) == 1: # single seg_map
                         seg_map = seg_maps[0]
                     elif len(seg_maps) > 1: # 2 seg_maps
-                        seg_map = np.logical_and(seg_maps[0], seg_maps[1])
+                        seg_map = np.logical_and(seg_maps[0], seg_maps[1]).astype(np.uint8)
 
-                    if seg_map is not None:
-                        cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_model.png'), seg_map) # save seg map
+                    #if seg_map is not None:
+                    #    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_model.png'), seg_map*255) # save seg map
 
                     ### get 2D seg_patch
                     joints_proj = np.matmul(intr, np.vstack((joints_3d.T, np.ones(17))))
@@ -230,7 +238,10 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
                             axes_length = [bone_norm, 2/dist_factor * limb_thick * bone_norm + bone_margin_width] # x, y length. x: bone length. y: width
 
                             #if part_i < 4: # if leg, reduce bone length
-                            axes_length[0] = axes_length[0] * (1-bone_margin_length)
+                            if part_i != 9: # if not head:
+                                axes_length[0] = axes_length[0] * (1-bone_margin_length)
+                            else:
+                                axes_length[0] = axes_length[0] * (1-0.45)
 
                             axes_length = tuple([int(e) for e in axes_length])
                             bone_unit_vector = (t-s)/bone_norm
@@ -250,7 +261,7 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
 
                             seg_patch = cv2.fillPoly(seg_patch, pts=np.array([pts], dtype=np.int32), color=(255,255,255))
 
-                    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_patch.png'), seg_patch) # save seg map
+                    #cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_patch.png'), seg_patch) # save seg map
 
                     if seg_map is None: # if no seg_map is inferred, just use patch
                         seg_map = seg_patch
@@ -258,15 +269,23 @@ def infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None):
                         seg_map = np.logical_or(seg_map, seg_patch)
 
                     if seg_map is None:
-                        print(f'{subj}/{seq}/{vid_i}_{i}: could not infer seg_map')
+                        print(f'{subj}/{seq}/{vid_i}_{i}: could not make seg_map')
                         continue
 
-                    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg.png'), seg_map) # save final seg map
-                    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_255.png'), seg_map * 255) # save seg map
+                    seg_map = np.clip(seg_map.astype(np.uint8),0,1) # reformat and clip
 
-                    seg_repeat = np.repeat(seg_map.reshape((*seg_map.shape, 1)), 3, axis=-1)
-                    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_orig.png'), np.multiply(img, seg_repeat)) # seg_map * img
-                    cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_orig.png'), img) # original img
+                    # make directory
+                    seg_vid_dir = path.join(vis_dir, subj, seq, f'video_{vid_i}_seg')
+                    if not path.exists(seg_vid_dir):
+                                os.makedirs(seg_vid_dir)
+                    frame_idx = str(i).zfill(6)
+                    cv2.imwrite(path.join(seg_vid_dir, f'{frame_idx+1}.png'), seg_map)
+                    #cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg.png'), seg_map) # save final seg map
+                    #cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_255.png'), seg_map * 255) # save seg map
+
+                    #seg_repeat = np.repeat(seg_map.reshape((*seg_map.shape, 1)), 3, axis=-1)
+                    #cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_seg_orig.png'), np.multiply(img, seg_repeat)) # seg_map * img
+                    #cv2.imwrite(path.join(vis_dir, f'{subj}', f'{seq}_{vid_i}_{i}_orig.png'), img) # original img
 
                     #parts.append(joints)
             pbar.update(1)
@@ -351,9 +370,7 @@ def run(args):
             out_file=None)
         return seg_map, img
 
-    vis_dir = 'mpi_vis_' + args.model
-
-    infer_mpi3d_pipeline(args, vis_dir, infer_fn, models, kwargs=None)
+    infer_mpi3d_pipeline(args, args.vis_dir, infer_fn, models, kwargs=None)
 
 if __name__ == '__main__':
     args = get_args()
